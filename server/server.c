@@ -1,4 +1,5 @@
 // server/server.c
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,11 +12,26 @@
 #define BUFFER_SIZE 256
 #define BACKLOG 100 // Increase the backlog for pending connections
 
+int server_sock = -1; // Global variable for the server socket
+
+// Signal handler for graceful shutdown
+void handle_shutdown(int sig) {
+    if (server_sock != -1) {
+        // Close the server socket
+        close(server_sock);
+        unlink(SOCKET_PATH); // Remove the socket file
+        printf("\nServer shut down gracefully.\n");
+    }
+    exit(0);
+}
+
 int main(int argc, char *argv[]) {
-    int server_sock, client_sock;
-    socklen_t len;
     struct sockaddr_un server_addr, client_addr;
     char buffer[BUFFER_SIZE];
+    socklen_t len;
+
+    // Set up the signal handler for SIGINT (Ctrl+C)
+    signal(SIGINT, handle_shutdown);
 
     // Create a Unix domain socket.
     server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -30,7 +46,7 @@ int main(int argc, char *argv[]) {
     strncpy(server_addr.sun_path, SOCKET_PATH,
             sizeof(server_addr.sun_path) - 1);
 
-    // Bind the socket to the path
+    // Set socket options to reuse the address
     int optval = 1;
     if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval,
                    sizeof(optval)) == -1) {
@@ -38,6 +54,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Bind the socket to the path
     if (bind(server_sock, (struct sockaddr *)&server_addr,
              sizeof(struct sockaddr_un)) == -1) {
         perror("Bind failed");
@@ -55,7 +72,7 @@ int main(int argc, char *argv[]) {
     while (true) {
         // Accept client connections.
         len = sizeof(struct sockaddr_un);
-        client_sock =
+        int client_sock =
             accept(server_sock, (struct sockaddr *)&client_addr, &len);
         if (client_sock == -1) {
             perror("Accept failed");
