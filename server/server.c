@@ -1,38 +1,22 @@
-#include <errno.h>
+// server/server.c
+
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #define SOCKET_PATH "/tmp/echo_socket"
-#define MAX_EVENTS 10
-#define BUFFER_SIZE 256
-#define NUM_THREADS 25
+#define BUFFER_SIZE 128
+#define BACKLOG 100
 
 int server_sock = -1; // Global variable for the server socket
-pthread_mutex_t server_sock_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Function to set the socket to non-blocking mode
-int set_non_blocking(int sockfd) {
-    int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags == -1) {
-        perror("fcntl failed");
-        return -1;
-    }
-
-    flags |= O_NONBLOCK;
-    if (fcntl(sockfd, F_SETFL, flags) == -1) {
-        perror("fcntl failed");
-        return -1;
-    }
-    return 0;
-}
 
 // Signal handler for graceful shutdown
 void handle_shutdown(int sig) {
@@ -45,137 +29,117 @@ void handle_shutdown(int sig) {
     exit(0);
 }
 
-// Worker thread function to handle each client connection
+// Function to handle the client connection with zero-copy using splice
 void *client_handler(void *arg) {
-    int client_sock = *((int *)arg);
-    free(arg);
-    char buffer[BUFFER_SIZE];
+    int client_sock = *(int *)arg;
+    free(arg); // Free the client socket pointer allocated in the main function
 
-    while (1) {
-        ssize_t bytes_received = recv(client_sock, buffer, sizeof(buffer), 0);
+    int pipe_fds[2]; // Pipe for zero-copy transfer
+    if (pipe(pipe_fds) == -1) {
+        perror("Pipe creation failed");
+        close(client_sock);
+        return NULL;
+    }
+
+    // Move data from the socket to the pipe
+    while (true) {
+        // Data is transferred from the client socket (client_sock) directly
+        // into the pipe's write end (pipe_fds[1]) via zero-copy.
+        ssize_t bytes_received = splice(client_sock, NULL, pipe_fds[1], NULL,
+                                        BUFFER_SIZE, SPLICE_F_MORE);
         if (bytes_received == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available right now, just continue
-                continue;
-            } else {
-                perror("Receive failed");
-                break;
-            }
+            perror("splice failed");
+            break;
         } else if (bytes_received == 0) {
-            // Client disconnected
+            // No more data to read, client closed the connection
             break;
         }
 
-        buffer[bytes_received] = '\0'; // Null-terminate the received data
-
-        // Echo the received data back to the client
-        if (send(client_sock, buffer, bytes_received, 0) == -1) {
-            perror("Send failed");
+        // The data is then transferred from the pipe's read end (pipe_fds[0])
+        // to the client socket (client_sock) via zero-copy.
+        if (splice(pipe_fds[0], NULL, client_sock, NULL, bytes_received,
+                   SPLICE_F_MORE) == -1) {
+            perror("splice failed");
             break;
         }
     }
 
-    // Close the client socket
     close(client_sock);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
     return NULL;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     struct sockaddr_un server_addr, client_addr;
-    char buffer[BUFFER_SIZE];
-    struct epoll_event event, events[MAX_EVENTS];
-    int epoll_fd, nfds;
+    socklen_t len;
 
-    // Register signal handler for graceful shutdown
+    // Set up the signal handler for SIGINT (Ctrl+C)
     signal(SIGINT, handle_shutdown);
 
-    // Create server socket
+    // Create a Unix domain socket.
     server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_sock == -1) {
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
+    // Set up the server address structure
+    memset(&server_addr, 0, sizeof(struct sockaddr_un));
     server_addr.sun_family = AF_UNIX;
-    strcpy(server_addr.sun_path, SOCKET_PATH);
+    strncpy(server_addr.sun_path, SOCKET_PATH,
+            sizeof(server_addr.sun_path) - 1);
 
+    // Bind the socket to the path
     if (bind(server_sock, (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) == -1) {
+             sizeof(struct sockaddr_un)) == -1) {
         perror("Bind failed");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_sock, 10) == -1) {
+    // Listen for incoming connections (allow a larger backlog)
+    if (listen(server_sock, BACKLOG) == -1) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
 
-    // Set up epoll
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        perror("epoll_create1 failed");
-        exit(EXIT_FAILURE);
-    }
+    printf("Server listening on %s\n", SOCKET_PATH);
 
-    // Set server socket to non-blocking mode
-    if (set_non_blocking(server_sock) == -1) {
-        exit(EXIT_FAILURE);
-    }
-
-    // Add server socket to epoll
-    event.events = EPOLLIN;
-    event.data.fd = server_sock;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) == -1) {
-        perror("epoll_ctl failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Event loop
-    while (1) {
-        nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        if (nfds == -1) {
-            perror("epoll_wait failed");
-            exit(EXIT_FAILURE);
+    while (true) {
+        // Accept client connections.
+        len = sizeof(struct sockaddr_un);
+        int client_sock =
+            accept(server_sock, (struct sockaddr *)&client_addr, &len);
+        if (client_sock == -1) {
+            perror("Accept failed");
+            continue; // Continue accepting other clients
         }
 
-        // Loop through events
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == server_sock) {
-                // Accept a new connection
-                socklen_t client_len = sizeof(client_addr);
-                int client_sock = accept(
-                    server_sock, (struct sockaddr *)&client_addr, &client_len);
-                if (client_sock == -1) {
-                    perror("Accept failed");
-                    continue;
-                }
+        // Allocate memory for the client socket and pass it to the thread
+        int *client_sock_ptr = malloc(sizeof(int));
+        if (client_sock_ptr == NULL) {
+            perror("Memory allocation failed");
+            close(client_sock);
+            continue;
+        }
+        *client_sock_ptr = client_sock;
 
-                // Set client socket to non-blocking mode
-                if (set_non_blocking(client_sock) == -1) {
-                    continue;
-                }
-
-                // Create a new thread for the client
-                pthread_t thread_id;
-                int *client_sock_ptr = malloc(sizeof(int));
-                *client_sock_ptr = client_sock;
-                if (pthread_create(&thread_id, NULL, client_handler,
-                                   client_sock_ptr) != 0) {
-                    perror("Thread creation failed");
-                    free(client_sock_ptr);
-                    close(client_sock);
-                    continue;
-                }
-
-                // Detach the thread to allow for automatic cleanup
-                pthread_detach(thread_id);
-            }
+        // Create a new thread to handle the client
+        pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, client_handler,
+                           (void *)client_sock_ptr) != 0) {
+            perror("Thread creation failed");
+            free(client_sock_ptr);
+            close(client_sock);
+        } else {
+            pthread_detach(
+                thread_id); // Detach the thread to allow auto cleanup
         }
     }
 
-    // Clean up
+    // Clean up and close the server socket
     close(server_sock);
-    unlink(SOCKET_PATH);
+    unlink(SOCKET_PATH); // Remove the socket file
+
     return 0;
 }
