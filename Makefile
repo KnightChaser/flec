@@ -3,10 +3,10 @@ BUILD_DIR := $(shell pwd)/build
 
 # Compiler and flags
 CC := gcc
-CFLAGS := -g -pthread
+CFLAGS := -g -lpthread
 
 # Source files and executables
-SERVER_SRC := ./server/server.c
+SERVER_SRC := ./server/*.c
 CLIENT_SRC := ./client/*.c
 SERVER_BIN := $(BUILD_DIR)/server
 CLIENT_BIN := $(BUILD_DIR)/client
