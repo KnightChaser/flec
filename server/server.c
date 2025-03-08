@@ -1,4 +1,4 @@
-// server/server.c
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -25,9 +25,39 @@ void handle_shutdown(int sig) {
     exit(0);
 }
 
+// Thread function to handle each client connection
+void *client_handler(void *arg) {
+    int client_sock = *(int *)arg;
+    char buffer[BUFFER_SIZE];
+
+    free(arg); // Free the client socket pointer allocated in the main function
+
+    // Process each request sequentially
+    while (true) {
+        ssize_t bytes_received = recv(client_sock, buffer, BUFFER_SIZE, 0);
+        if (bytes_received == -1) {
+            perror("Receive failed");
+            break;
+        } else if (bytes_received == 0) {
+            break; // Exit the loop when the client disconnects
+        }
+
+        buffer[bytes_received] = '\0'; // Null-terminate the received data
+
+        // Send the received data back to the client
+        if (send(client_sock, buffer, bytes_received, 0) == -1) {
+            perror("Send failed");
+            break;
+        }
+    }
+
+    // Clean up and close the client socket
+    close(client_sock);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     struct sockaddr_un server_addr, client_addr;
-    char buffer[BUFFER_SIZE];
     socklen_t len;
 
     // Set up the signal handler for SIGINT (Ctrl+C)
@@ -79,31 +109,26 @@ int main(int argc, char *argv[]) {
             continue; // Continue accepting other clients
         }
 
-        // printf("Client connected\n");
-
-        // Process each request sequentially
-        while (true) {
-            ssize_t bytes_received = recv(client_sock, buffer, BUFFER_SIZE, 0);
-            if (bytes_received == -1) {
-                perror("Receive failed");
-                break;
-            } else if (bytes_received == 0) {
-                // printf("Client disconnected\n");
-                break; // Exit the loop when the client disconnects
-            }
-
-            buffer[bytes_received] = '\0';
-            // printf("Received: %s\n", buffer);
-
-            // Send the received data back to the client
-            if (send(client_sock, buffer, bytes_received, 0) == -1) {
-                perror("Send failed");
-                break;
-            }
+        // Allocate memory for the client socket and pass it to the thread
+        int *client_sock_ptr = malloc(sizeof(int));
+        if (client_sock_ptr == NULL) {
+            perror("Memory allocation failed");
+            close(client_sock);
+            continue;
         }
+        *client_sock_ptr = client_sock;
 
-        // Clean up and close the client socket
-        close(client_sock);
+        // Create a new thread to handle the client
+        pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, client_handler,
+                           (void *)client_sock_ptr) != 0) {
+            perror("Thread creation failed");
+            free(client_sock_ptr);
+            close(client_sock);
+        } else {
+            pthread_detach(
+                thread_id); // Detach the thread to allow auto cleanup
+        }
     }
 
     // Clean up and close the server socket
